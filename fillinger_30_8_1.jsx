@@ -4,18 +4,41 @@
  * Modernized from the original Fillinger / Circle Fill script.
  * Original concept: A Jongware; modification and refactoring: Alexander Ladygin.
  * Copyright (c) 2018 Alexander Ladygin.
- * Released under the MIT License; see reference/LICENSE-original-MIT.txt.
+ *
+ * MIT License
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
  */
 
 (function () {
     var SCRIPT_NAME = "Fillinger 30.8.1";
-    var SETTINGS_VERSION = "2";
-    var CURVE_FLATTEN_STEPS = 12;
+    var SETTINGS_VERSION = "5";
+    var CURVE_FLATTEN_STEPS = 8;
     var GEOMETRY_EPSILON = 0.0001;
-    var RADIUS_STEP_FACTOR = 0.667;
-    var MAX_ATTEMPTS_PER_RADIUS = 1000;
-    var MAX_GENERATED_ITEMS = 2000;
-    var UI_UPDATE_INTERVAL = 50;
+    var BEST_CANDIDATE_SAMPLES = 4;
+    var MAX_STAGNANT_BATCHES = 20;
+    var MIN_RADIUS_STAGNANT_BATCHES = 40;
+    var SIZE_STEP_COUNT = 24;
+    var MAX_GENERATED_ITEMS = 600;
+    var UI_UPDATE_INTERVAL = 100;
+    var OUTLINE_SAFETY_FACTOR = 0.001;
+    var ACTUAL_BOUNDS_TOLERANCE = 0.5;
     var APP_FOLDER_NAME = "AdobeIllustratorFillinger";
     var createdItems = [];
     var logger = null;
@@ -23,9 +46,10 @@
 
     var DEFAULTS = {
         maxSize: 10,
-        minSize: 4,
+        minSize: 3,
+        fillRemaining: 20,
+        finalFillRemaining: 80,
         minDistance: 0,
-        resize: 70,
         rotationMode: "random",
         rotationValue: 0,
         boundaryMode: "topmost",
@@ -58,13 +82,15 @@
             if (!ensureFolder(root) || !ensureFolder(logs)) { return result; }
             var file = new File(logs.fsName + "/fillinger.log");
             result.write = function (message) {
+                var opened = false;
                 try {
                     file.encoding = "UTF-8";
-                    if (file.open("a")) {
-                        file.writeln("[" + nowText() + "] " + safeString(message));
-                        file.close();
-                    }
-                } catch (ignoreWrite) {}
+                    opened = file.open("a");
+                    if (opened) { file.writeln("[" + nowText() + "] " + safeString(message)); }
+                } catch (ignoreWrite) {
+                } finally {
+                    if (opened) { try { file.close(); } catch (ignoreClose) {} }
+                }
             };
         } catch (ignoreLogger) {}
         return result;
@@ -94,7 +120,9 @@
     function copyDefaults() {
         return {
             maxSize: DEFAULTS.maxSize, minSize: DEFAULTS.minSize,
-            minDistance: DEFAULTS.minDistance, resize: DEFAULTS.resize,
+            fillRemaining: DEFAULTS.fillRemaining,
+            finalFillRemaining: DEFAULTS.finalFillRemaining,
+            minDistance: DEFAULTS.minDistance,
             rotationMode: DEFAULTS.rotationMode, rotationValue: DEFAULTS.rotationValue,
             boundaryMode: DEFAULTS.boundaryMode, groupResult: DEFAULTS.groupResult,
             randomFillers: DEFAULTS.randomFillers, removeBoundary: DEFAULTS.removeBoundary
@@ -109,7 +137,8 @@
 
     function loadSettings() {
         var result = copyDefaults();
-        var file;
+        var file = null;
+        var opened = false;
         var lines;
         var i;
         var splitAt;
@@ -119,9 +148,9 @@
             file = settingsFile();
             if (file === null || !file.exists) { return result; }
             file.encoding = "UTF-8";
-            if (!file.open("r")) { return result; }
+            opened = file.open("r");
+            if (!opened) { return result; }
             lines = file.read().split(/\r?\n/);
-            file.close();
             for (i = 0; i < lines.length; i++) {
                 splitAt = lines[i].indexOf("=");
                 if (splitAt < 1) { continue; }
@@ -129,8 +158,9 @@
                 value = lines[i].substring(splitAt + 1);
                 if (key === "maxSize") { result.maxSize = parseNumber(value, result.maxSize, 0.01, 100); }
                 else if (key === "minSize") { result.minSize = parseNumber(value, result.minSize, 0.01, 100); }
+                else if (key === "fillRemaining") { result.fillRemaining = parseNumber(value, result.fillRemaining, 1, 100); }
+                else if (key === "finalFillRemaining") { result.finalFillRemaining = parseNumber(value, result.finalFillRemaining, 1, 100); }
                 else if (key === "minDistance") { result.minDistance = parseNumber(value, result.minDistance, 0, 1000000); }
-                else if (key === "resize") { result.resize = parseNumber(value, result.resize, 1, 100); }
                 else if (key === "rotationMode" && (value === "random" || value === "fixed")) { result.rotationMode = value; }
                 else if (key === "rotationValue") { result.rotationValue = parseNumber(value, result.rotationValue, -360000, 360000); }
                 else if (key === "boundaryMode" && (value === "topmost" || value === "bottommost" || value === "selection")) { result.boundaryMode = value; }
@@ -140,31 +170,40 @@
             }
         } catch (error) {
             logger.write("settings read warning=" + safeString(error.message));
-            return copyDefaults();
+            result = copyDefaults();
+        } finally {
+            if (opened && file !== null) { try { file.close(); } catch (ignoreClose) {} }
         }
         if (result.minSize > result.maxSize) { result.minSize = result.maxSize; }
         return result;
     }
 
     function saveSettings(settings) {
+        var file = null;
+        var opened = false;
         try {
-            var file = settingsFile();
+            file = settingsFile();
             if (file === null) { return; }
             file.encoding = "UTF-8";
-            if (!file.open("w")) { return; }
+            opened = file.open("w");
+            if (!opened) { return; }
             file.writeln("version=" + SETTINGS_VERSION);
             file.writeln("maxSize=" + settings.maxSize);
             file.writeln("minSize=" + settings.minSize);
+            file.writeln("fillRemaining=" + settings.fillRemaining);
+            file.writeln("finalFillRemaining=" + settings.finalFillRemaining);
             file.writeln("minDistance=" + settings.minDistance);
-            file.writeln("resize=" + settings.resize);
             file.writeln("rotationMode=" + settings.rotationMode);
             file.writeln("rotationValue=" + settings.rotationValue);
             file.writeln("boundaryMode=" + settings.boundaryMode);
             file.writeln("groupResult=" + settings.groupResult);
             file.writeln("randomFillers=" + settings.randomFillers);
             file.writeln("removeBoundary=" + settings.removeBoundary);
-            file.close();
-        } catch (error) { logger.write("settings write warning=" + safeString(error.message)); }
+        } catch (error) {
+            logger.write("settings write warning=" + safeString(error.message));
+        } finally {
+            if (opened && file !== null) { try { file.close(); } catch (ignoreClose) {} }
+        }
     }
 
     function collectionToArray(collection) {
@@ -177,7 +216,27 @@
     function boundsWidth(bounds) { return Math.abs(bounds[2] - bounds[0]); }
     function boundsHeight(bounds) { return Math.abs(bounds[1] - bounds[3]); }
     function boundsCenter(bounds) { return [(bounds[0] + bounds[2]) / 2, (bounds[1] + bounds[3]) / 2]; }
-    function getBoundsCenter(item) { return boundsCenter(item.geometricBounds); }
+    function boundsDiagonal(bounds) {
+        var width = boundsWidth(bounds);
+        var height = boundsHeight(bounds);
+        return Math.sqrt(width * width + height * height);
+    }
+
+    function copyBounds(bounds) {
+        return [Number(bounds[0]), Number(bounds[1]), Number(bounds[2]), Number(bounds[3])];
+    }
+
+    function getVisibleBoundsSafe(item) {
+        var bounds;
+        try {
+            bounds = item.visibleBounds;
+            if (bounds && bounds.length === 4) { return copyBounds(bounds); }
+        } catch (ignoreVisible) {}
+        bounds = item.geometricBounds;
+        return copyBounds(bounds);
+    }
+
+    function getBoundsCenter(item) { return boundsCenter(getVisibleBoundsSafe(item)); }
 
     function moveCenterTo(item, x, y) {
         var center = getBoundsCenter(item);
@@ -198,6 +257,21 @@
         try { return Number(item.zOrderPosition); } catch (ignore) { return fallback; }
     }
 
+    function candidatesShareParent(candidates) {
+        var parent;
+        var i;
+        if (candidates.length < 2) { return true; }
+        try { parent = candidates[0].item.parent; } catch (ignoreParent) { return false; }
+        for (i = 1; i < candidates.length; i++) {
+            try {
+                if (candidates[i].item.parent !== parent) { return false; }
+            } catch (ignoreOtherParent) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     function selectBoundary(selection, mode) {
         var candidates = [];
         var i;
@@ -209,6 +283,10 @@
         }
         if (candidates.length === 0) { throw new Error("Selection contains no PathItem or CompoundPathItem boundary."); }
         if (mode === "selection") { return candidates[0].item; }
+        if (!candidatesShareParent(candidates)) {
+            logger.write("boundary stacking fallback=selection-order mode=" + mode + " reason=different-parents");
+            return mode === "bottommost" ? candidates[candidates.length - 1].item : candidates[0].item;
+        }
         chosen = candidates[0];
         chosenPosition = stackingPosition(chosen.item, chosen.index);
         for (i = 1; i < candidates.length; i++) {
@@ -289,6 +367,48 @@
         return inside;
     }
 
+    function crossValue(a, b, c) {
+        return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+    }
+
+    function segmentsIntersectOrTouch(a, b, c, d) {
+        var o1 = crossValue(a, b, c);
+        var o2 = crossValue(a, b, d);
+        var o3 = crossValue(c, d, a);
+        var o4 = crossValue(c, d, b);
+        if (Math.abs(o1) <= GEOMETRY_EPSILON && pointOnSegment(c, a, b)) { return true; }
+        if (Math.abs(o2) <= GEOMETRY_EPSILON && pointOnSegment(d, a, b)) { return true; }
+        if (Math.abs(o3) <= GEOMETRY_EPSILON && pointOnSegment(a, c, d)) { return true; }
+        if (Math.abs(o4) <= GEOMETRY_EPSILON && pointOnSegment(b, c, d)) { return true; }
+        return ((o1 > GEOMETRY_EPSILON && o2 < -GEOMETRY_EPSILON) ||
+                (o1 < -GEOMETRY_EPSILON && o2 > GEOMETRY_EPSILON)) &&
+            ((o3 > GEOMETRY_EPSILON && o4 < -GEOMETRY_EPSILON) ||
+                (o3 < -GEOMETRY_EPSILON && o4 > GEOMETRY_EPSILON));
+    }
+
+    function contoursIntersectOrTouch(first, second) {
+        var i;
+        var j;
+        var firstNext;
+        var secondNext;
+        for (i = 0; i < first.length; i++) {
+            firstNext = (i + 1) % first.length;
+            for (j = 0; j < second.length; j++) {
+                secondNext = (j + 1) % second.length;
+                if (segmentsIntersectOrTouch(first[i], first[firstNext], second[j], second[secondNext])) { return true; }
+            }
+        }
+        return false;
+    }
+
+    function allVerticesInside(inner, outer) {
+        var i;
+        for (i = 0; i < inner.length; i++) {
+            if (!pointInPolygon(inner[i], outer)) { return false; }
+        }
+        return true;
+    }
+
     function triangleArea(a, b, c) {
         return Math.abs((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])) / 2;
     }
@@ -363,12 +483,13 @@
     function buildBoundaryGeometry(boundary) {
         var contours = [];
         var i;
+        var j;
         var largest = 0;
         var outerIndex = -1;
         var area;
         var outer;
         var holes = [];
-        var probe;
+        var candidate;
         if (boundary.typename === "PathItem") { contours.push(flattenPath(boundary)); }
         else {
             if (boundary.pathItems.length === 0) { throw new Error("CompoundPathItem has no subpaths."); }
@@ -382,16 +503,21 @@
         outer = contours[outerIndex];
         for (i = 0; i < contours.length; i++) {
             if (i === outerIndex) { continue; }
-            probe = contours[i][0];
-            if (!pointInPolygon(probe, outer)) {
+            candidate = contours[i];
+            if (contoursIntersectOrTouch(candidate, outer)) {
+                throw new Error("Compound path contours may not cross or touch the outer contour.");
+            }
+            if (!allVerticesInside(candidate, outer)) {
                 throw new Error("Compound paths with multiple disconnected outer islands are not supported.");
             }
-            holes.push(contours[i]);
+            holes.push(candidate);
         }
         for (i = 0; i < holes.length; i++) {
-            var j;
-            for (j = 0; j < holes.length; j++) {
-                if (i !== j && pointInPolygon(holes[i][0], holes[j])) {
+            for (j = i + 1; j < holes.length; j++) {
+                if (contoursIntersectOrTouch(holes[i], holes[j])) {
+                    throw new Error("Compound path holes may not cross or touch each other.");
+                }
+                if (pointInPolygon(holes[i][0], holes[j]) || pointInPolygon(holes[j][0], holes[i])) {
                     throw new Error("Nested compound contours (islands inside holes) are not supported.");
                 }
             }
@@ -521,21 +647,565 @@
         return best;
     }
 
-    function collides(point, radius, placements, minimumDistance) {
+    function usableBoundaryArea(geometry) {
+        var area = Math.abs(polygonArea(geometry.outer));
         var i;
-        var required;
+        for (i = 0; i < geometry.holes.length; i++) {
+            area -= Math.abs(polygonArea(geometry.holes[i]));
+        }
+        return Math.max(area, 0);
+    }
+
+    function pointInPolygonStrict(point, polygon) {
+        var inside = false;
+        var i;
+        var j;
+        var crosses;
+        for (i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+            if (pointOnSegment(point, polygon[j], polygon[i])) { return false; }
+            crosses = ((polygon[i][1] > point[1]) !== (polygon[j][1] > point[1])) &&
+                (point[0] < (polygon[j][0] - polygon[i][0]) * (point[1] - polygon[i][1]) /
+                (polygon[j][1] - polygon[i][1]) + polygon[i][0]);
+            if (crosses) { inside = !inside; }
+        }
+        return inside;
+    }
+
+    function signWithEpsilon(value) {
+        if (value > GEOMETRY_EPSILON) { return 1; }
+        if (value < -GEOMETRY_EPSILON) { return -1; }
+        return 0;
+    }
+
+    function projectionOverlapLength(a1, a2, b1, b2) {
+        var firstMin = Math.min(a1, a2);
+        var firstMax = Math.max(a1, a2);
+        var secondMin = Math.min(b1, b2);
+        var secondMax = Math.max(b1, b2);
+        return Math.min(firstMax, secondMax) - Math.max(firstMin, secondMin);
+    }
+
+    function segmentIntersectionKind(a, b, c, d) {
+        var o1 = signWithEpsilon(crossValue(a, b, c));
+        var o2 = signWithEpsilon(crossValue(a, b, d));
+        var o3 = signWithEpsilon(crossValue(c, d, a));
+        var o4 = signWithEpsilon(crossValue(c, d, b));
+        var overlap;
+        if (o1 * o2 < 0 && o3 * o4 < 0) { return 2; }
+        if (o1 === 0 && o2 === 0 && o3 === 0 && o4 === 0) {
+            if (Math.abs(b[0] - a[0]) >= Math.abs(b[1] - a[1])) {
+                overlap = projectionOverlapLength(a[0], b[0], c[0], d[0]);
+            } else {
+                overlap = projectionOverlapLength(a[1], b[1], c[1], d[1]);
+            }
+            if (overlap > GEOMETRY_EPSILON) { return 3; }
+            if (overlap >= -GEOMETRY_EPSILON) { return 1; }
+            return 0;
+        }
+        if (o1 === 0 && pointOnSegment(c, a, b)) { return 1; }
+        if (o2 === 0 && pointOnSegment(d, a, b)) { return 1; }
+        if (o3 === 0 && pointOnSegment(a, c, d)) { return 1; }
+        if (o4 === 0 && pointOnSegment(b, c, d)) { return 1; }
+        return 0;
+    }
+
+    function segmentDistance(a, b, c, d) {
+        if (segmentIntersectionKind(a, b, c, d) > 0) { return 0; }
+        return Math.min(
+            distancePointToSegment(a, c, d),
+            distancePointToSegment(b, c, d),
+            distancePointToSegment(c, a, b),
+            distancePointToSegment(d, a, b)
+        );
+    }
+
+    function rectangleContour(bounds) {
+        return [
+            [bounds[0], bounds[1]],
+            [bounds[2], bounds[1]],
+            [bounds[2], bounds[3]],
+            [bounds[0], bounds[3]]
+        ];
+    }
+
+    function largestClosedContourFromItem(item) {
+        var contour = null;
+        var candidate;
+        var bestArea = 0;
+        var area;
+        var i;
+        try {
+            if (item.typename === "PathItem") {
+                if (!item.closed) { return null; }
+                return flattenPath(item);
+            }
+            if (item.typename === "CompoundPathItem") {
+                for (i = 0; i < item.pathItems.length; i++) {
+                    if (!item.pathItems[i].closed) { continue; }
+                    candidate = flattenPath(item.pathItems[i]);
+                    area = Math.abs(polygonArea(candidate));
+                    if (area > bestArea) {
+                        bestArea = area;
+                        contour = candidate;
+                    }
+                }
+            }
+        } catch (ignoreContour) { return null; }
+        return contour;
+    }
+
+    function effectMarginFromBounds(item, visibleBounds) {
+        var geometric;
+        var margin = 0;
+        var i;
+        try {
+            geometric = copyBounds(item.geometricBounds);
+            for (i = 0; i < 4; i++) {
+                margin = Math.max(margin, Math.abs(visibleBounds[i] - geometric[i]));
+            }
+        } catch (ignoreGeometric) {}
+        margin += Math.max(boundsWidth(visibleBounds), boundsHeight(visibleBounds)) * OUTLINE_SAFETY_FACTOR;
+        return margin;
+    }
+
+    function normalizeContour(contour, center) {
+        var result = [];
+        var i;
+        for (i = 0; i < contour.length; i++) {
+            result.push([contour[i][0] - center[0], contour[i][1] - center[1]]);
+        }
+        return result;
+    }
+
+    function contourLooksCircular(contour, center, visibleBounds) {
+        var width = boundsWidth(visibleBounds);
+        var height = boundsHeight(visibleBounds);
+        var aspect;
+        var areaRatio;
+        var minRadius = 1.7976931348623157e+308;
+        var maxRadius = 0;
+        var i;
+        var r;
+        if (contour === null || contour.length < 12 || width <= GEOMETRY_EPSILON || height <= GEOMETRY_EPSILON) {
+            return false;
+        }
+        aspect = Math.max(width, height) / Math.min(width, height);
+        if (aspect > 1.05) { return false; }
+        areaRatio = Math.abs(polygonArea(contour)) / (width * height);
+        if (Math.abs(areaRatio - Math.PI / 4) > 0.08) { return false; }
+        for (i = 0; i < contour.length; i++) {
+            r = distance(contour[i], center);
+            minRadius = Math.min(minRadius, r);
+            maxRadius = Math.max(maxRadius, r);
+        }
+        if (minRadius <= GEOMETRY_EPSILON) { return false; }
+        return maxRadius / minRadius <= 1.08;
+    }
+
+    function buildFillerProfile(item, index) {
+        var visible = getVisibleBoundsSafe(item);
+        var center = boundsCenter(visible);
+        var width = boundsWidth(visible);
+        var height = boundsHeight(visible);
+        var visibleMax = Math.max(width, height);
+        var sourceContour = largestClosedContourFromItem(item);
+        var area;
+        var circular;
+        var safety;
+        var envelope;
+        if (visibleMax <= GEOMETRY_EPSILON) { throw new Error("A filler has zero-size visible/geometric bounds."); }
+        area = sourceContour !== null && sourceContour.length >= 3 ?
+            Math.abs(polygonArea(sourceContour)) : width * height;
+        circular = contourLooksCircular(sourceContour, center, visible);
+        safety = visibleMax * OUTLINE_SAFETY_FACTOR;
+        if (circular) {
+            envelope = [];
+            var circleRadius = visibleMax / 2 + safety;
+            var vertexRadius = circleRadius / Math.cos(Math.PI / 8);
+            var c;
+            for (c = 0; c < 8; c++) {
+                var theta = Math.PI / 8 + c * Math.PI / 4;
+                envelope.push([Math.cos(theta) * vertexRadius, Math.sin(theta) * vertexRadius]);
+            }
+        } else {
+            envelope = [
+                [-width / 2 - safety, height / 2 + safety],
+                [width / 2 + safety, height / 2 + safety],
+                [width / 2 + safety, -height / 2 - safety],
+                [-width / 2 - safety, -height / 2 - safety]
+            ];
+        }
+        return {
+            sourceIndex: index,
+            contour: envelope,
+            area: area,
+            visibleMax: visibleMax,
+            mode: circular ? "circle-envelope" : "oriented-bounds-envelope"
+        };
+    }
+
+    function buildFillerProfiles(sources) {
+        var profiles = [];
+        var i;
+        for (i = 0; i < sources.length; i++) {
+            profiles.push(buildFillerProfile(sources[i], i));
+            logger.write("filler profile index=" + i + " typename=" + sources[i].typename +
+                " mode=" + profiles[i].mode + " vertices=" + profiles[i].contour.length);
+        }
+        return profiles;
+    }
+
+    function rotateAndScaleLocalPoint(local, scale, cosValue, sinValue, center) {
+        var x = local[0] * scale;
+        var y = local[1] * scale;
+        return [
+            center[0] + x * cosValue - y * sinValue,
+            center[1] + x * sinValue + y * cosValue
+        ];
+    }
+
+    function contourBounds(contour, padding) {
+        var left = contour[0][0];
+        var right = contour[0][0];
+        var top = contour[0][1];
+        var bottom = contour[0][1];
+        var i;
+        for (i = 1; i < contour.length; i++) {
+            left = Math.min(left, contour[i][0]);
+            right = Math.max(right, contour[i][0]);
+            top = Math.max(top, contour[i][1]);
+            bottom = Math.min(bottom, contour[i][1]);
+        }
+        return [left - padding, top + padding, right + padding, bottom - padding];
+    }
+
+    function buildCandidate(profile, point, radius, angle) {
+        var targetSize = radius * 2;
+        var scale = targetSize / profile.visibleMax;
+        var radians = angle * Math.PI / 180;
+        var cosValue = Math.cos(radians);
+        var sinValue = Math.sin(radians);
+        var contour = [];
+        var i;
+        var broadRadius = 0;
+        var transformed;
+        for (i = 0; i < profile.contour.length; i++) {
+            transformed = rotateAndScaleLocalPoint(profile.contour[i], scale, cosValue, sinValue, point);
+            contour.push(transformed);
+            broadRadius = Math.max(broadRadius, distance(point, transformed));
+        }
+        return {
+            point: point,
+            radius: radius,
+            sourceIndex: profile.sourceIndex,
+            angle: angle,
+            targetSize: targetSize,
+            contour: contour,
+            fillArea: profile.area * scale * scale,
+            margin: 0,
+            broadRadius: broadRadius,
+            aabb: contourBounds(contour, 0)
+        };
+    }
+
+    function aabbSeparated(first, second, clearance) {
+        return first[2] + clearance < second[0] || second[2] + clearance < first[0] ||
+            first[3] - clearance > second[1] || second[3] - clearance > first[1];
+    }
+
+    function polygonHasInteriorPointInside(first, second) {
+        var i;
+        var next;
         var dx;
         var dy;
-        for (i = 0; i < placements.length; i++) {
-            required = radius + placements[i].radius + minimumDistance;
-            dx = Math.abs(point[0] - placements[i].point[0]);
-            dy = Math.abs(point[1] - placements[i].point[1]);
-            if (dx < required && dy < required && distance(point, placements[i].point) < required) { return true; }
+        var length;
+        var orientation = polygonArea(first) >= 0 ? 1 : -1;
+        var epsilonStep;
+        var sample;
+        for (i = 0; i < first.length; i++) {
+            if (pointInPolygonStrict(first[i], second)) { return true; }
+        }
+        for (i = 0; i < first.length; i++) {
+            next = (i + 1) % first.length;
+            dx = first[next][0] - first[i][0];
+            dy = first[next][1] - first[i][1];
+            length = Math.sqrt(dx * dx + dy * dy);
+            if (length <= GEOMETRY_EPSILON) { continue; }
+            epsilonStep = Math.max(GEOMETRY_EPSILON * 10, length * 0.000001);
+            sample = [
+                (first[i][0] + first[next][0]) / 2 + orientation * (-dy / length) * epsilonStep,
+                (first[i][1] + first[next][1]) / 2 + orientation * (dx / length) * epsilonStep
+            ];
+            if (pointInPolygonStrict(sample, second)) { return true; }
         }
         return false;
     }
 
-    function calculatePlacements(geometry, sampler, bounds, settings, progress) {
+    function contourAgainstContour(first, second, clearance) {
+        var i;
+        var j;
+        var firstNext;
+        var secondNext;
+        var kind;
+        var gap;
+        for (i = 0; i < first.length; i++) {
+            firstNext = (i + 1) % first.length;
+            for (j = 0; j < second.length; j++) {
+                secondNext = (j + 1) % second.length;
+                kind = segmentIntersectionKind(first[i], first[firstNext], second[j], second[secondNext]);
+                if (kind === 2) { return true; }
+                if ((kind === 1 || kind === 3) && clearance > GEOMETRY_EPSILON) { return true; }
+                if (clearance > GEOMETRY_EPSILON && kind === 0) {
+                    gap = segmentDistance(first[i], first[firstNext], second[j], second[secondNext]);
+                    if (gap + GEOMETRY_EPSILON < clearance) { return true; }
+                }
+            }
+        }
+        if (polygonHasInteriorPointInside(first, second) || polygonHasInteriorPointInside(second, first)) { return true; }
+        return false;
+    }
+
+    function segmentBounds(a, b, padding) {
+        return [
+            Math.min(a[0], b[0]) - padding,
+            Math.max(a[1], b[1]) + padding,
+            Math.max(a[0], b[0]) + padding,
+            Math.min(a[1], b[1]) - padding
+        ];
+    }
+
+    function cellRangeForAabb(aabb, cellSize, padding) {
+        var expanded = [aabb[0] - padding, aabb[1] + padding, aabb[2] + padding, aabb[3] - padding];
+        return {
+            minX: Math.floor(expanded[0] / cellSize),
+            maxX: Math.floor(expanded[2] / cellSize),
+            minY: Math.floor(expanded[3] / cellSize),
+            maxY: Math.floor(expanded[1] / cellSize)
+        };
+    }
+
+    function createBoundarySpatialIndex(geometry, cellSize) {
+        var index = { cellSize: Math.max(cellSize, 1), buckets: {}, segments: [], nextId: 1, queryToken: 1 };
+        var contours = [geometry.outer];
+        var i;
+        var j;
+        var next;
+        var segment;
+        var x;
+        var y;
+        var key;
+        for (i = 0; i < geometry.holes.length; i++) { contours.push(geometry.holes[i]); }
+        for (i = 0; i < contours.length; i++) {
+            for (j = 0; j < contours[i].length; j++) {
+                next = (j + 1) % contours[i].length;
+                segment = {
+                    id: index.nextId++,
+                    a: contours[i][j],
+                    b: contours[i][next],
+                    aabb: segmentBounds(contours[i][j], contours[i][next], 0),
+                    _seenToken: 0
+                };
+                index.segments.push(segment);
+                var dx = segment.b[0] - segment.a[0];
+                var dy = segment.b[1] - segment.a[1];
+                var steps = Math.max(1, Math.ceil(Math.max(Math.abs(dx), Math.abs(dy)) / index.cellSize));
+                var step;
+                var sampleX;
+                var sampleY;
+                var cellX;
+                var cellY;
+                for (step = 0; step <= steps; step++) {
+                    sampleX = segment.a[0] + dx * step / steps;
+                    sampleY = segment.a[1] + dy * step / steps;
+                    cellX = Math.floor(sampleX / index.cellSize);
+                    cellY = Math.floor(sampleY / index.cellSize);
+                    for (x = -1; x <= 1; x++) {
+                        for (y = -1; y <= 1; y++) {
+                            key = (cellX + x) + "," + (cellY + y);
+                            if (!index.buckets[key]) { index.buckets[key] = []; }
+                            index.buckets[key].push(segment);
+                        }
+                    }
+                }
+            }
+        }
+        return index;
+    }
+
+    function queryBoundarySegments(index, aabb) {
+        var range = cellRangeForAabb(aabb, index.cellSize, 0);
+        var result = [];
+        var token = index.queryToken++;
+        var x;
+        var y;
+        var key;
+        var bucket;
+        var i;
+        var segment;
+        for (x = range.minX; x <= range.maxX; x++) {
+            for (y = range.minY; y <= range.maxY; y++) {
+                key = x + "," + y;
+                bucket = index.buckets[key];
+                if (!bucket) { continue; }
+                for (i = 0; i < bucket.length; i++) {
+                    segment = bucket[i];
+                    if (segment._seenToken !== token) {
+                        segment._seenToken = token;
+                        result.push(segment);
+                    }
+                }
+            }
+        }
+        return result;
+    }
+
+    function candidateFitsBoundary(candidate, geometry, boundaryIndex) {
+        var i;
+        var next;
+        var nearbySegments;
+        var segment;
+        var kind;
+
+        if (!pointInRegion(candidate.point, geometry)) { return false; }
+        nearbySegments = queryBoundarySegments(boundaryIndex, candidate.aabb);
+
+        if (nearbySegments.length === 0) { return true; }
+
+        if (!pointInRegion(candidate.contour[0], geometry)) { return false; }
+        for (i = 0; i < candidate.contour.length; i++) {
+            next = (i + 1) % candidate.contour.length;
+            var j;
+            for (j = 0; j < nearbySegments.length; j++) {
+                segment = nearbySegments[j];
+                if (aabbSeparated(segmentBounds(candidate.contour[i], candidate.contour[next], 0),
+                        segment.aabb, 0)) { continue; }
+                kind = segmentIntersectionKind(candidate.contour[i], candidate.contour[next], segment.a, segment.b);
+                if (kind === 2) { return false; }
+            }
+        }
+
+        for (i = 0; i < geometry.holes.length; i++) {
+            if (pointInPolygonStrict(geometry.holes[i][0], candidate.contour)) { return false; }
+        }
+        return true;
+    }
+
+    function createSpatialGrid(cellSize) {
+        return { cellSize: Math.max(cellSize, 1), buckets: {}, nextId: 1, queryToken: 1 };
+    }
+
+    function addToSpatialGrid(grid, placement) {
+        var range;
+        var x;
+        var y;
+        var key;
+        placement._gridId = grid.nextId++;
+        range = cellRangeForAabb(placement.aabb, grid.cellSize, 0);
+        for (x = range.minX; x <= range.maxX; x++) {
+            for (y = range.minY; y <= range.maxY; y++) {
+                key = x + "," + y;
+                if (!grid.buckets[key]) { grid.buckets[key] = []; }
+                grid.buckets[key].push(placement);
+            }
+        }
+    }
+
+    function nearbyPlacements(grid, aabb, padding) {
+        var range = cellRangeForAabb(aabb, grid.cellSize, padding);
+        var result = [];
+        var token = grid.queryToken++;
+        var x;
+        var y;
+        var key;
+        var bucket;
+        var i;
+        var placement;
+        for (x = range.minX; x <= range.maxX; x++) {
+            for (y = range.minY; y <= range.maxY; y++) {
+                key = x + "," + y;
+                bucket = grid.buckets[key];
+                if (!bucket) { continue; }
+                for (i = 0; i < bucket.length; i++) {
+                    placement = bucket[i];
+                    if (placement._seenToken !== token) {
+                        placement._seenToken = token;
+                        result.push(placement);
+                    }
+                }
+            }
+        }
+        return result;
+    }
+
+    function candidateCollides(candidate, grid, minimumDistance) {
+        var nearby = nearbyPlacements(grid, candidate.aabb, minimumDistance);
+        var i;
+        var other;
+        var clearance;
+        for (i = 0; i < nearby.length; i++) {
+            other = nearby[i];
+            clearance = candidate.margin + other.margin + minimumDistance;
+            if (distance(candidate.point, other.point) > candidate.broadRadius + other.broadRadius + minimumDistance + GEOMETRY_EPSILON) {
+                continue;
+            }
+            if (aabbSeparated(candidate.aabb, other.aabb, minimumDistance)) { continue; }
+            if (contourAgainstContour(candidate.contour, other.contour, clearance)) { return true; }
+        }
+        return false;
+    }
+
+    function chooseProfileIndex(profiles, randomFillers) {
+        if (randomFillers) { return randomInt(profiles.length); }
+        return 0;
+    }
+
+    function chooseAngle(settings) {
+        return settings.rotationMode === "random" ? randomRange(0, 360) : settings.rotationValue;
+    }
+
+    function tryPlacement(radius, geometry, sampler, settings, profiles, grid, boundaryIndex) {
+        var point = samplePoint(sampler);
+        var profileIndex = chooseProfileIndex(profiles, settings.randomFillers);
+        var angle = chooseAngle(settings);
+        var candidate = buildCandidate(profiles[profileIndex], point, radius, angle);
+        if (!candidateFitsBoundary(candidate, geometry, boundaryIndex)) { return null; }
+        if (candidateCollides(candidate, grid, settings.minDistance)) { return null; }
+        return candidate;
+    }
+
+    function candidateSpacingScore(candidate, grid) {
+        var searchPadding = grid.cellSize * 2;
+        var nearby = nearbyPlacements(grid, candidate.aabb, searchPadding);
+        var best = 1.7976931348623157e+308;
+        var i;
+        var gap;
+        if (nearby.length === 0) { return grid.cellSize * 4; }
+        for (i = 0; i < nearby.length; i++) {
+            gap = distance(candidate.point, nearby[i].point) - candidate.broadRadius - nearby[i].broadRadius;
+            if (gap < best) { best = gap; }
+        }
+        return best;
+    }
+
+    function findBestCandidate(radius, geometry, sampler, settings, profiles, grid, boundaryIndex) {
+        var best = null;
+        var bestScore = -1.7976931348623157e+308;
+        var sample;
+        var candidate;
+        var score;
+        for (sample = 0; sample < BEST_CANDIDATE_SAMPLES; sample++) {
+            candidate = tryPlacement(radius, geometry, sampler, settings, profiles, grid, boundaryIndex);
+            if (candidate === null) { continue; }
+            score = candidateSpacingScore(candidate, grid) + Math.random() * 0.000001;
+            if (best === null || score > bestScore) {
+                best = candidate;
+                bestScore = score;
+            }
+        }
+        return best;
+    }
+
+    function calculatePlacements(geometry, sampler, bounds, settings, progress, profiles) {
         var width = boundsWidth(bounds);
         var height = boundsHeight(bounds);
         var referenceSize = Math.sqrt(width * height);
@@ -543,47 +1213,110 @@
         var minRadius = referenceSize * settings.minSize / 200;
         var radii = [];
         var radius = maxRadius;
+        var radiusStep;
+        var sizeIndex;
         var placements = [];
+        var gridCellSize = Math.max(maxRadius * 1.1, settings.minDistance + 1, 8);
+        var grid = createSpatialGrid(gridCellSize);
+        var boundaryIndex = createBoundarySpatialIndex(geometry, gridCellSize);
+        var totalArea = usableBoundaryArea(geometry);
+        var filledArea = 0;
         var level;
-        var attempt;
-        var point;
-        if (referenceSize <= GEOMETRY_EPSILON || minRadius <= 0) { throw new Error("Boundary is too small for the requested size."); }
-        while (radius >= minRadius - GEOMETRY_EPSILON) {
-            radii.push(radius);
-            radius *= RADIUS_STEP_FACTOR;
+        var candidate;
+        var remainingAtLevelStart;
+        var levelFillPercent;
+        var levelTargetArea;
+        var levelFilledArea;
+        var failedBatches;
+        var maxFailedBatches;
+        var insertedAtLevel;
+        var progressFraction;
+        if (referenceSize <= GEOMETRY_EPSILON || minRadius <= 0 || totalArea <= GEOMETRY_EPSILON) {
+            throw new Error("Boundary is too small for the requested size.");
         }
-        if (radii.length === 0 || radii[radii.length - 1] > minRadius + GEOMETRY_EPSILON) { radii.push(minRadius); }
+        if (Math.abs(maxRadius - minRadius) <= GEOMETRY_EPSILON) {
+            radii.push(maxRadius);
+        } else {
+            radiusStep = (maxRadius - minRadius) / SIZE_STEP_COUNT;
+            for (sizeIndex = 0; sizeIndex <= SIZE_STEP_COUNT; sizeIndex++) {
+                radii.push(maxRadius - radiusStep * sizeIndex);
+            }
+            radii[radii.length - 1] = minRadius;
+        }
+
+        logger.write("stable packing usable area=" + totalArea +
+            " size steps=" + SIZE_STEP_COUNT + " size levels=" + radii.length +
+            " grid cell=" + gridCellSize +
+            " best-candidate samples=" + BEST_CANDIDATE_SAMPLES +
+            " max items=" + MAX_GENERATED_ITEMS);
+
         for (level = 0; level < radii.length && placements.length < MAX_GENERATED_ITEMS; level++) {
             radius = radii[level];
-            for (attempt = 0; attempt < MAX_ATTEMPTS_PER_RADIUS && placements.length < MAX_GENERATED_ITEMS; attempt++) {
-                point = samplePoint(sampler);
-                if (pointInRegion(point, geometry) && distanceToClosestBoundary(point, geometry) + GEOMETRY_EPSILON >= radius &&
-                        !collides(point, radius, placements, settings.minDistance)) {
-                    placements.push({ point: point, radius: radius });
+            remainingAtLevelStart = Math.max(totalArea - filledArea, 0);
+            levelFillPercent = level === radii.length - 1 ? settings.finalFillRemaining : settings.fillRemaining;
+            levelTargetArea = remainingAtLevelStart * levelFillPercent / 100;
+            levelFilledArea = 0;
+            failedBatches = 0;
+            insertedAtLevel = 0;
+            maxFailedBatches = level === radii.length - 1 ? MIN_RADIUS_STAGNANT_BATCHES : MAX_STAGNANT_BATCHES;
+
+            while (levelFilledArea + GEOMETRY_EPSILON < levelTargetArea &&
+                    placements.length < MAX_GENERATED_ITEMS && failedBatches < maxFailedBatches) {
+                candidate = findBestCandidate(radius, geometry, sampler, settings, profiles, grid, boundaryIndex);
+                if (candidate === null) {
+                    failedBatches++;
+                } else {
+                    placements.push(candidate);
+                    addToSpatialGrid(grid, candidate);
+                    levelFilledArea += candidate.fillArea;
+                    filledArea += candidate.fillArea;
+                    insertedAtLevel++;
+                    failedBatches = 0;
                 }
-                if (attempt % UI_UPDATE_INTERVAL === 0) { progress(5 + 55 * (level + attempt / MAX_ATTEMPTS_PER_RADIUS) / radii.length); }
+
+                progressFraction = levelTargetArea <= GEOMETRY_EPSILON ? 1 :
+                    Math.min(levelFilledArea / levelTargetArea, 1);
+                if ((insertedAtLevel + failedBatches) % 4 === 0) {
+                    progress(5 + 55 * (level + progressFraction) / radii.length);
+                }
             }
+
+            logger.write("stable level=" + (level + 1) + "/" + radii.length +
+                " size%=" + (radius * 200 / referenceSize) +
+                " fillLimit%=" + levelFillPercent +
+                " targetArea=" + levelTargetArea + " filledArea=" + levelFilledArea +
+                " inserted=" + insertedAtLevel + " failedBatches=" + failedBatches +
+                " approxCoverage%=" + (filledArea / totalArea * 100));
         }
-        if (placements.length >= MAX_GENERATED_ITEMS) { logger.write("warning maximum generated item limit reached=" + MAX_GENERATED_ITEMS); }
+
+        placements._filledArea = filledArea;
+        placements._usableArea = totalArea;
+        placements._coverage = totalArea > GEOMETRY_EPSILON ? filledArea / totalArea * 100 : 0;
+        if (placements.length >= MAX_GENERATED_ITEMS) {
+            logger.write("warning stable maximum generated item limit reached=" + MAX_GENERATED_ITEMS);
+        }
         return placements;
     }
 
-    function chooseSource(sources, randomFillers, index) {
-        if (randomFillers) { return sources[randomInt(sources.length)]; }
-        return sources[index % sources.length];
+    function resizeItemByPercent(item, scale) {
+        item.resize(scale, scale, true, true, true, true, scale);
     }
 
-    function scaleItemToSafeDiameter(item, diameter, resizePercent) {
-        var bounds = item.geometricBounds;
-        var width = boundsWidth(bounds);
-        var height = boundsHeight(bounds);
-        var diagonal = Math.sqrt(width * width + height * height);
-        var targetDiagonal = diameter * resizePercent / 100;
+    function scaleItemToTargetSize(item, targetSize) {
+        var bounds = getVisibleBoundsSafe(item);
+        var visibleMax = Math.max(boundsWidth(bounds), boundsHeight(bounds));
         var scale;
-        if (diagonal <= GEOMETRY_EPSILON) { throw new Error("A filler has zero-size geometric bounds."); }
-        scale = targetDiagonal / diagonal * 100;
-        /* Last four true values scale fill patterns, gradients, stroke patterns and stroke widths. */
-        item.resize(scale, scale, true, true, true, true, scale);
+        if (visibleMax <= GEOMETRY_EPSILON) { throw new Error("A filler has zero-size visible/geometric bounds."); }
+        scale = targetSize / visibleMax * 100;
+        resizeItemByPercent(item, scale);
+    }
+
+    function actualBoundsFitCandidate(item, candidate) {
+        var bounds = getVisibleBoundsSafe(item);
+        return bounds[0] + ACTUAL_BOUNDS_TOLERANCE >= candidate.aabb[0] &&
+            bounds[1] - ACTUAL_BOUNDS_TOLERANCE <= candidate.aabb[1] &&
+            bounds[2] - ACTUAL_BOUNDS_TOLERANCE <= candidate.aabb[2] &&
+            bounds[3] + ACTUAL_BOUNDS_TOLERANCE >= candidate.aabb[3];
     }
 
     function cleanupCreatedItems() {
@@ -599,24 +1332,24 @@
         var i;
         var source;
         var duplicate;
-        var angle;
+        if (placements.length === 0) { return 0; }
         if (settings.groupResult) {
             group = doc.groupItems.add();
             createdItems.push(group);
             group.move(boundary, ElementPlacement.PLACEBEFORE);
         }
         for (i = 0; i < placements.length; i++) {
-            source = chooseSource(sources, settings.randomFillers, i);
+            source = sources[placements[i].sourceIndex];
             duplicate = source.duplicate();
             createdItems.push(duplicate);
             if (group !== null) { duplicate.move(group, ElementPlacement.INSIDE); }
             else { duplicate.move(boundary, ElementPlacement.PLACEBEFORE); }
-            scaleItemToSafeDiameter(duplicate, placements[i].radius * 2, settings.resize);
+            scaleItemToTargetSize(duplicate, placements[i].targetSize);
             moveCenterTo(duplicate, placements[i].point[0], placements[i].point[1]);
-            angle = settings.rotationMode === "random" ? randomRange(0, 360) : settings.rotationValue;
-            if (angle !== 0) {
-                duplicate.rotate(angle);
-                moveCenterTo(duplicate, placements[i].point[0], placements[i].point[1]);
+            if (placements[i].angle !== 0) { duplicate.rotate(placements[i].angle); }
+            moveCenterTo(duplicate, placements[i].point[0], placements[i].point[1]);
+            if (!actualBoundsFitCandidate(duplicate, placements[i])) {
+                throw new Error("Rendered filler exceeded its lightweight safety envelope. Try a simpler/expanded appearance or increase Minimum distance.");
             }
             if (i % UI_UPDATE_INTERVAL === 0) { progress(60 + 40 * (i + 1) / Math.max(placements.length, 1)); }
         }
@@ -635,24 +1368,25 @@
 
     function showDialog(initial) {
         var win = new Window("dialog", SCRIPT_NAME);
-        var sizePanel = win.add("panel", undefined, "Size (of boundary reference size)");
+        var sizePanel = win.add("panel", undefined, "Size / fill");
         var maxSize = addLabeledField(sizePanel, "Maximum size %", initial.maxSize);
         var minSize = addLabeledField(sizePanel, "Minimum size %", initial.minSize);
-        var spacingPanel = win.add("panel", undefined, "Spacing / filler scaling");
+        var stepInfo = sizePanel.add("statictext", undefined, "Size range is automatically divided into 24 equal steps.");
+        var fillRemaining = addLabeledField(sizePanel, "Fill remaining per step %", initial.fillRemaining);
+        var finalFillRemaining = addLabeledField(sizePanel, "Final size fill remaining %", initial.finalFillRemaining);
+        var spacingPanel = win.add("panel", undefined, "Spacing");
         var minDistance = addLabeledField(spacingPanel, "Minimum distance (pt)", initial.minDistance);
-        var resize = addLabeledField(spacingPanel, "Resize value %", initial.resize);
         var rotationPanel = win.add("panel", undefined, "Rotation");
         var randomRotation = rotationPanel.add("radiobutton", undefined, "Random rotation");
         var fixedRotation = rotationPanel.add("radiobutton", undefined, "Fixed rotation");
         var rotationValue = addLabeledField(rotationPanel, "Rotation angle", initial.rotationValue);
         var boundaryPanel = win.add("panel", undefined, "Boundary selection");
-        var topmost = boundaryPanel.add("radiobutton", undefined, "Topmost selected object (stacking order)");
-        var bottommost = boundaryPanel.add("radiobutton", undefined, "Bottommost selected object (stacking order)");
+        var topmost = boundaryPanel.add("radiobutton", undefined, "Topmost (same parent; otherwise first selected)");
+        var bottommost = boundaryPanel.add("radiobutton", undefined, "Bottommost (same parent; otherwise last selected)");
         var selectionOrder = boundaryPanel.add("radiobutton", undefined, "Use selection order (first eligible)");
         var groupResult = win.add("checkbox", undefined, "Group generated objects");
         var randomFillers = win.add("checkbox", undefined, "Random filler objects");
         var removeBoundary = win.add("checkbox", undefined, "Remove boundary after execution");
-        var progress = win.add("progressbar", undefined, 0, 100);
         var buttons = win.add("group");
         var cancel = buttons.add("button", undefined, "Cancel", { name: "cancel" });
         var run = buttons.add("button", undefined, "Run", { name: "ok" });
@@ -664,7 +1398,6 @@
         spacingPanel.alignChildren = "fill";
         rotationPanel.alignChildren = "left";
         boundaryPanel.alignChildren = "left";
-        progress.preferredSize = [360, 12];
         randomRotation.value = initial.rotationMode === "random";
         fixedRotation.value = !randomRotation.value;
         rotationValue.enabled = fixedRotation.value;
@@ -681,8 +1414,9 @@
             var parsed = copyDefaults();
             parsed.maxSize = parseNumber(maxSize.text, DEFAULTS.maxSize, 0.01, 100);
             parsed.minSize = parseNumber(minSize.text, DEFAULTS.minSize, 0.01, 100);
+            parsed.fillRemaining = parseNumber(fillRemaining.text, DEFAULTS.fillRemaining, 1, 100);
+            parsed.finalFillRemaining = parseNumber(finalFillRemaining.text, DEFAULTS.finalFillRemaining, 1, 100);
             parsed.minDistance = parseNumber(minDistance.text, DEFAULTS.minDistance, 0, 1000000);
-            parsed.resize = parseNumber(resize.text, DEFAULTS.resize, 1, 100);
             parsed.rotationMode = randomRotation.value ? "random" : "fixed";
             parsed.rotationValue = parseNumber(rotationValue.text, DEFAULTS.rotationValue, -360000, 360000);
             parsed.boundaryMode = topmost.value ? "topmost" : (bottommost.value ? "bottommost" : "selection");
@@ -747,6 +1481,7 @@
         var settings = showDialog(loadSettings());
         var boundary;
         var sources;
+        var profiles;
         var geometry;
         var triangles;
         var sampler;
@@ -767,6 +1502,7 @@
         settings.progress = progressWindow.update;
         boundary = selectBoundary(state.selection, settings.boundaryMode);
         sources = collectFillSources(state.selection, boundary, settings.randomFillers);
+        profiles = buildFillerProfiles(sources);
         logger.write("boundary typename=" + boundary.typename + " source filler count=" + sources.length);
         settings.progress(2);
         geometry = buildBoundaryGeometry(boundary);
@@ -775,16 +1511,22 @@
         triangles = triangulatePolygon(geometry.outer);
         sampler = buildAreaSampler(triangles);
         logger.write("triangle count=" + triangles.length);
-        placements = calculatePlacements(geometry, sampler, boundary.geometricBounds, settings, settings.progress);
-        logger.write("placement count=" + placements.length);
+        placements = calculatePlacements(geometry, sampler, boundary.geometricBounds, settings, settings.progress, profiles);
+        logger.write("placement count=" + placements.length + " coverage%=" + safeString(placements._coverage));
         generated = createGeneratedArtwork(state.doc, boundary, sources, placements, settings, settings.progress);
-        if (settings.removeBoundary) { boundary.remove(); }
+        if (settings.removeBoundary && generated > 0) { boundary.remove(); }
         createdItems = [];
         settings.progress(100);
         progressWindow.close();
         activeProgressWindow = null;
         logger.write("generated object count=" + generated + " runtime ms=" + (new Date().getTime() - started));
-        alert("Fillinger completed. Generated objects: " + generated, SCRIPT_NAME);
+        if (generated === 0) {
+            logger.write("warning no valid placements found; boundary preserved");
+            alert("Fillinger completed, but no valid placements were found. The boundary was preserved.", SCRIPT_NAME);
+        } else {
+            alert("Fillinger completed. Generated objects: " + generated +
+                "\nApprox. filled area: " + Math.round(placements._coverage * 10) / 10 + "%", SCRIPT_NAME);
+        }
     }
 
     function errorDetails(error) {
