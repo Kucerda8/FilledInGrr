@@ -1,82 +1,85 @@
 # FilledInGrr — Fillinger pro Illustrator 30.8.1
 
-## Co FilledInGrr dělá
+Finální stabilní verze používá lehčí packing navržený tak, aby zůstal použitelný i při stovkách fillerů v Illustratoru/ExtendScriptu.
 
-`fillinger_30_8_1.jsx` rozmístí duplicity jednoho či více vybraných filler objektů dovnitř uzavřené hranice. Packing používá postupně menší bezpečné kružnice, plošně rovnoměrné vzorkování triangulovaného vnějšího contouru, test holes, vzdálenost od všech hran a kruhový collision model.
+## Řízení velikostí
 
-Zdrojové fillery se nemění. Skript nejprve vypočítá placementy v paměti a až potom vytváří duplicity.
+`Resize value`, `Target total coverage` a ruční `Size step` byly odstraněny.
 
-## Cílové prostředí
+Uživatel nastavuje pouze:
 
-- Adobe Illustrator **30.8.1 / Illustrator 2026**
-- Windows 11
-- ExtendScript JSX (konzervativní ECMAScript 3 syntax)
-- Illustrator JavaScript DOM a ScriptUI
+- `Maximum size %`
+- `Minimum size %`
+- `Fill remaining per step %`
+- `Final size fill remaining %`
+- `Minimum distance (pt)`
 
-V repozitáři není Illustrator runtime; proběhla statická kontrola, ale je nutná ruční validace v přesném buildu Illustratoru 30.8.1.
+Rozsah mezi `Maximum size` a `Minimum size` se automaticky rozdělí na **24 stejných kroků**. To znamená 25 velikostních úrovní včetně obou krajních hodnot.
 
-## Instalace a spuštění
+Příklad pro interval 10 % až 3 %:
 
-1. Otevřete dokument v Illustratoru.
-2. Vyberte hranici a alespoň jeden filler.
-3. Spusťte **File → Scripts → Other Script… → `fillinger_30_8_1.jsx`**.
+- rozdíl je 7 procentních bodů,
+- jeden krok je `7 / 24 = 0,291666…` procentního bodu,
+- velikosti jsou přibližně `10,00 → 9,71 → 9,42 → … → 3,29 → 3,00 %`.
 
-Skript je jediný samostatný JSX soubor a nemá runtime dependency.
+Pokud je Maximum size stejné jako Minimum size, použije se jediná velikost.
 
-## Použití
+## Vyplňování plochy
 
-### Výběr
+Každá běžná velikost se pokusí zaplnit maximálně `Fill remaining per step %` z plochy, která byla volná na začátku daného kroku.
 
-- **Boundary:** uzavřený `PathItem` nebo podporovaný `CompoundPathItem`.
-- **Fillers:** `PathItem`, `CompoundPathItem`, `GroupItem`, `TextFrame`, `PlacedItem` nebo `SymbolItem`, pokud jej Illustrator dovolí duplikovat.
-- Výběr musí mít nejméně dva objekty.
+Poslední minimální velikost používá samostatný limit `Final size fill remaining %`, aby mohla doplnit zbylé mezery výrazněji než předchozí velikosti.
 
-Režimy boundary:
+`Minimum distance = 0` dovoluje kolizním obálkám dotyk.
 
-- **Topmost/Bottommost selected object (stacking order)** porovnávají `zOrderPosition` mezi podporovanými kandidáty. U objektů v různých kontejnerech/layers nemusí být hodnoty globálně srovnatelné; při shodě je deterministický fallback pořadí selection.
-- **Use selection order** použije první podporovaný boundary objekt v poli `document.selection`. Illustrator může pořadí selection určovat podle svého DOM/layer chování, nikoli podle geometrické Y pozice.
+## Geometrie a výkon
 
-### Volby dialogu
+Boundary zůstává shape-aware a používá skutečnou uzavřenou křivku. Bézierovy úseky jsou kvůli stabilitě zploštěny na 8 mezikroků.
 
-- **Maximum/Minimum size %:** rozsah poloměrů placementů odvozený z `sqrt(width × height)` boundary; platí `0 < minimum ≤ maximum ≤ 100`.
-- **Minimum distance:** mezera mezi rezervovanými kružnicemi v bodech.
-- **Resize value %:** část bezpečného průměru využitá fillerem.
-- **Random rotation / Fixed rotation:** náhodný úhel 0–360° nebo zadaný úhel.
-- **Random filler objects:** náhodně střídá zdroje. Je-li jediným zdrojem `GroupItem`, používá jeho přímé podporované child `pageItems` jako varianty.
-- **Group generated objects:** vytvoří group pouze pro nové duplicity.
-- **Remove boundary after execution:** odstraní boundary až po úspěšném vytvoření výsledku.
+Kolize fillerů používají lehčí obálky:
 
-Scale zachovává poměr stran přes `resize()`. Bezpečný dosah je odvozen z diagonály `geometricBounds`, takže rezervovaný kruh zůstává konzervativní i při rotaci. Illustratoru jsou předány volby pro proporcionální scale fill/stroke patterns, gradients a stroke widths.
+- kruhový filler používá lehkou osmiúhelníkovou obálku,
+- ostatní fillery používají rotovaný `visibleBounds` obdélník.
 
-## Geometrická strategie a audit originálu
+Dlouhý úzký filler proto neblokuje velkou opsanou kružnici, ale odpovídající úzkou rotovanou oblast.
 
-Nová implementace opravuje zejména neúplnou validaci document/selection, boolean sort comparator, obrácený `isNaN` test resize, implicitní globals, `constructor.name`, `hasOwnProperty` na DOM proxy, chybný index posledního bodu hole, pevné čtyřkrokové flattening, mutující hole triangulaci, nulový progress divisor a unsafe scale před rotací. Settings jsou skutečný `key=value` UTF-8 text namísto ne-JSON obsahu v `.json`.
+Packing používá spatial grid, boundary spatial index, 4 best-candidate vzorky a adaptive stop. Velikostní krok se ukončí, když už po sérii pokusů nenachází další použitelné místo.
 
-Outer contour je největší contour podle absolutní plochy. Ostatní contoury musejí ležet uvnitř něj a jsou holes. Samostatné outer islands a nested islands jsou odmítnuty, protože tichý chybný výsledek by byl horší než omezená podpora. Outer polygon je ear-clipping triangulován; náhodné body se vybírají podle kumulativní plochy triangle a body v holes se odmítnou.
+Bezpečnostní limit je **600 výsledných objektů**.
+
+## Výchozí nastavení
+
+- Maximum size: 10 %
+- Minimum size: 3 %
+- Automatické kroky: 24
+- Fill remaining per step: 20 %
+- Final size fill remaining: 80 %
+- Minimum distance: 0 pt
+- Random rotation
+
+## Boundary selection
+
+- `Topmost` a `Bottommost` používají stacking order, pokud kandidáti sdílejí parent.
+- Pokud jsou ve více kontejnerech/layers, použije se deterministický fallback podle pořadí selection.
+- `Use selection order` použije první vhodný boundary objekt.
 
 ## Omezení
 
-- Podporován je jeden outer contour a nenested holes. Více oddělených islands a island uvnitř hole vyvolají jasnou chybu.
-- Self-intersecting, extrémně degenerované nebo numericky patologické cesty nejsou podporovány.
-- Bézier křivky jsou aproximovány 12 segmenty na zakřivený úsek; výsledek je konzervativní vůči aproximovanému polygonu, nikoli matematicky přesné křivce.
-- Kolize a boundary safety používají kružnici opsanou `geometricBounds`. Je to bezpečné, ale u úzkých/konkávních objektů méně husté.
-- `geometricBounds` nezahrnuje viditelný stroke. Výrazný stroke může vizuálně přesáhnout vypočtený kruh; scénář je proto povinnou součástí ručního testování.
-- Clipping groups, plugin artwork a další neuvedené typy nejsou samostatně garantovány.
-- Packing je náhodný a není seeded; počet i rozmístění se mezi běhy liší.
-- Safety limity jsou 1 000 pokusů na radius level a 2 000 výsledků.
-- Failure cleanup odstraňuje vytvořené duplicity/group, ale nemůže poskytovat plnou transakční atomitu Illustrator DOM.
+- Boundary podporuje jeden outer contour a nenested holes.
+- Self-intersecting nebo výrazně degenerované cesty nejsou podporovány.
+- U konkávních fillerů se používá lehčí bezpečnostní obálka místo přesného konkávního obrysu.
+- Plugin artwork a velmi složité live effects mohou vyžadovat rozšíření vzhledu.
+- Packing je náhodný a není seeded; výsledek se mezi běhy může mírně lišit.
 
 ## Settings a log
 
-- Settings: `%APPDATA%` odpovídající `Folder.userData/AdobeIllustratorFillinger/settings.txt`
+- Settings: `Folder.userData/AdobeIllustratorFillinger/settings.txt`
 - Log: `Folder.userData/AdobeIllustratorFillinger/logs/fillinger.log`
 
-Poškozený settings soubor se načítá defensivně s defaults. Logger zaznamenává prostředí, výběr, geometrii, placements, výsledky, runtime a diagnostiku chyb; selhání logování nezastaví artwork operaci.
+Starší položka `sizeStep` v existujícím settings souboru je ignorována a při dalším uložení už se nezapisuje.
 
 ## Reference a licence
 
-- `reference/fillinger-original.jsx` — historická implementace a behavior reference
-- `docs/illustrator-30.8.1-scripting-research.md` — autoritativní technický podklad projektu
-- `reference/LICENSE-original-MIT.txt` — původní MIT licence a attribution (Copyright © 2018 Alexander Ladygin)
-
-Modernizovaná varianta zachovává attribution původního Fillingeru a je určena pro Illustrator 30.8.1.
+- `reference/fillinger-original.jsx` — historická implementace
+- `docs/illustrator-30.8.1-scripting-research.md` — technický podklad
+- `reference/LICENSE-original-MIT.txt` — původní MIT licence a attribution
